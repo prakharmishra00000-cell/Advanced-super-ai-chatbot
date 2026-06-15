@@ -7,10 +7,10 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const PLAN_CONFIGS: Record<string, { days: number; promptsLimit: number }> = {
-  basic: { days: 30, promptsLimit: 100 },
-  pro: { days: 90, promptsLimit: 500 },
-  premium: { days: 365, promptsLimit: 999999 }
+const PLAN_CONFIGS: Record<string, { amount: number; days: number; promptsLimit: number; name: string }> = {
+  basic: { amount: 9900, days: 30, promptsLimit: 100, name: 'Basic Plan' },
+  pro: { amount: 19900, days: 90, promptsLimit: 500, name: 'Pro Plan' },
+  premium: { amount: 99900, days: 365, promptsLimit: 999999, name: 'Premium Plan' }
 };
 
 Deno.serve(async (req: Request) => {
@@ -20,36 +20,30 @@ Deno.serve(async (req: Request) => {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const razorpayKeyId = Deno.env.get('RAZORPAY_KEY');
     const razorpaySecret = Deno.env.get('RAZORPAY_SECRET');
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
     const body = await req.json();
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
+    const { sessionToken, plan } = body;
 
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) return new Response(JSON.stringify({ error: "Missing payment details" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    if (!sessionToken) return new Response(JSON.stringify({ error: "Session required" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    if (!plan || !PLAN_CONFIGS[plan]) return new Response(JSON.stringify({ error: "Invalid plan" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 
-    const encoder = new TextEncoder();
-    const data = encoder.encode(`${razorpay_order_id}|${razorpay_payment_id}`);
-    const keyData = encoder.encode(razorpaySecret);
-    const key = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const signature = await crypto.subtle.sign('HMAC', key, data);
-    const generatedSignature = btoa(String.fromCharCode(...new Uint8Array(signature)));
+    const { data: session, error } = await supabase.from('user_sessions').select(`*, users!inner(*)`).eq('session_token', sessionToken).gt('expires_at', new Date().toISOString()).single();
+    if (error || !session) return new Response(JSON.stringify({ error: "Invalid session" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 
-    if (generatedSignature !== razorpay_signature) return new Response(JSON.stringify({ error: "Payment verification failed" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    const user = session.users;
+    const planConfig = PLAN_CONFIGS[plan];
+    const auth = btoa(`${razorpayKeyId}:${razorpaySecret}`);
+    const orderResponse = await fetch('https://api.razorpay.com/v1/orders', { method: 'POST', headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: planConfig.amount, currency: 'INR', receipt: `rcpt_${user.id}_${Date.now()}`, payment_capture: 1 }) });
 
-    const { data: transaction, error: txnError } = await supabase.from('transactions').select('*, users(*)').eq('razorpay_order_id', razorpay_order_id).single();
-    if (txnError || !transaction) return new Response(JSON.stringify({ error: "Transaction not found" }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-    if (transaction.status !== 'pending') return new Response(JSON.stringify({ error: "Already processed" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    if (!orderResponse.ok) return new Response(JSON.stringify({ error: "Failed to create order" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    const orderData = await orderResponse.json();
+    await supabase.from('transactions').insert({ user_id: user.id, razorpay_order_id: orderData.id, amount: planConfig.amount, currency: 'INR', plan, status: 'pending' });
 
-    const planConfig = PLAN_CONFIGS[transaction.plan];
-    if (!planConfig) return new Response(JSON.stringify({ error: "Invalid plan" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-
-    const expiryDate = new Date(Date.now() + planConfig.days * 24 * 60 * 60 * 1000);
-    await supabase.from('transactions').update({ razorpay_payment_id, razorpay_signature, status: 'completed', updated_at: new Date().toISOString() }).eq('id', transaction.id);
-    const { data: updatedUser } = await supabase.from('users').update({ plan: transaction.plan, plan_expiry: expiryDate.toISOString(), prompts_limit: planConfig.promptsLimit, updated_at: new Date().toISOString() }).eq('id', transaction.user_id).select().single();
-
-    return new Response(JSON.stringify({ success: true, message: "Payment successful! Plan activated.", plan: transaction.plan, planExpiry: expiryDate.toISOString(), promptsLimit: planConfig.promptsLimit, user: { id: updatedUser.id, phone: updatedUser.phone, plan: updatedUser.plan, planExpiry: updatedUser.plan_expiry, promptsLimit: updatedUser.prompts_limit } }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ success: true, orderId: orderData.id, amount: planConfig.amount, currency: 'INR', plan, planName: planConfig.name, razorpayKey: razorpayKeyId, prefill: { contact: user.phone } }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
   } catch (error) {
-    console.error('Verify payment error:', error);
+    console.error('Payment error:', error);
     return new Response(JSON.stringify({ error: "Internal server error" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
   }
 });
